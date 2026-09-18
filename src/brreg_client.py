@@ -1,85 +1,78 @@
-"""Client for the Brønnøysund Register Centre's public Enhetsregisteret API.
-
-This is Norway's official, free, government company registry — the
-"permitted public source" this agent relies on as its primary, authoritative
-source of truth. No API key is required.
-
-Docs: https://data.brreg.no/enhetsregisteret/api/docs/index.html
-"""
+"""Client for the official Brønnøysund Register Centre APIs."""
+import time
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
-
 from . import config
 from .models import CompanyProfile
 from .budget_guard import BudgetGuard
 
-HEADERS = {"Accept": "application/json", "User-Agent": "signalpost-agent/1.0"}
+HEADERS = {"Accept": "application/json", "User-Agent": "signalpost-agent/2.0"}
+class CompanyNotFound(Exception): pass
 
+def _get(url, params=None, guard=None, attempts=3):
+    last = None
+    for attempt in range(attempts):
+        if guard: guard.reserve_request(0.0)
+        try:
+            r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+            if r.status_code == 404: raise CompanyNotFound(url)
+            r.raise_for_status()
+            return r.json()
+        except CompanyNotFound: raise
+        except (requests.RequestException, ValueError) as exc:
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(min(2 ** attempt, 4))
+    raise last
 
-class CompanyNotFound(Exception):
-    pass
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-def _get(url: str, params: dict | None = None) -> dict:
-    response = requests.get(url, headers=HEADERS, params=params, timeout=15)
-    if response.status_code == 404:
-        raise CompanyNotFound(url)
-    response.raise_for_status()
-    return response.json()
-
-
-def _parse_entity(entity: dict) -> CompanyProfile:
-    org_number = entity.get("organisasjonsnummer", "")
+def _parse_entity(entity):
+    org_number = str(entity.get("organisasjonsnummer", ""))
     address_info = entity.get("forretningsadresse") or {}
     org_form = entity.get("organisasjonsform") or {}
     industry = entity.get("naeringskode1") or {}
-
     return CompanyProfile(
-        org_number=org_number,
-        name=entity.get("navn", ""),
+        org_number=org_number, name=entity.get("navn", ""),
         org_form_code=org_form.get("kode"),
         org_form_description=org_form.get("beskrivelse"),
         industry_code=industry.get("kode"),
         industry_description=industry.get("beskrivelse"),
         address=", ".join(address_info.get("adresse", []) or []) or None,
-        postal_code=address_info.get("postnummer"),
-        city=address_info.get("poststed"),
+        postal_code=address_info.get("postnummer"), city=address_info.get("poststed"),
         municipality=address_info.get("kommune"),
         registration_date=entity.get("registreringsdatoEnhetsregisteret"),
         founding_date=entity.get("stiftelsesdato"),
         number_of_employees=entity.get("antallAnsatte"),
-        is_bankrupt=entity.get("konkurs"),
-        homepage=entity.get("hjemmeside"),
+        is_bankrupt=entity.get("konkurs"), homepage=entity.get("hjemmeside"),
         source_url=f"https://data.brreg.no/enhetsregisteret/api/enheter/{org_number}",
     )
 
-
-def get_company(org_number: str, guard: BudgetGuard | None = None) -> CompanyProfile:
-    """Fetch a single company's verified facts by organization number."""
-    url = config.BRREG_ENTITY_ENDPOINT.format(org_number=org_number)
-    entity = _get(url)
-    if guard:
-        guard.record_request(cost_usd=0.0)  # the registry API is free
+def get_company(org_number, guard=None):
+    org_number = str(org_number).strip()
+    if not org_number.isdigit():
+        raise ValueError("Norwegian organization number must contain digits only.")
+    entity = _get(config.BRREG_ENTITY_ENDPOINT.format(org_number=org_number), guard=guard)
     profile = _parse_entity(entity)
-    # Safety check: never let a fact get attached to the wrong company.
-    assert profile.org_number == org_number, "Org number mismatch — discarding record."
+    if profile.org_number != org_number:
+        raise ValueError("Org number mismatch — record discarded.")
     return profile
 
-
-def list_org_numbers(target_count: int, guard: BudgetGuard | None = None) -> list[str]:
-    """Pull a list of real, currently-registered Norwegian org numbers by
-    paging through the public registry listing endpoint."""
-    org_numbers: list[str] = []
+def list_entities(target_count, guard=None, page_size=None):
+    """Return registry entities directly. This avoids 1,000 redundant detail calls."""
+    target_count = max(0, int(target_count))
+    page_size = page_size or config.BRREG_PAGE_SIZE
+    entities_out = []
     page = 0
-    while len(org_numbers) < target_count:
-        params = {"page": page, "size": config.BRREG_PAGE_SIZE}
-        data = _get(config.BRREG_LIST_ENDPOINT, params=params)
-        if guard:
-            guard.record_request(cost_usd=0.0)
+    while len(entities_out) < target_count:
+        data = _get(config.BRREG_LIST_ENDPOINT,
+                    params={"page": page, "size": min(page_size, target_count-len(entities_out))},
+                    guard=guard)
         entities = data.get("_embedded", {}).get("enheter", [])
-        if not entities:
-            break  # no more pages available
-        org_numbers.extend(e.get("organisasjonsnummer") for e in entities)
+        if not entities: break
+        for e in entities:
+            if e.get("organisasjonsnummer"):
+                entities_out.append(e)
+                if len(entities_out) >= target_count: break
         page += 1
-    return org_numbers[:target_count]
+    return entities_out[:target_count]
+
+def list_org_numbers(target_count, guard=None):
+    return [str(e.get("organisasjonsnummer")) for e in list_entities(target_count, guard=guard)]

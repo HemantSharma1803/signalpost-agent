@@ -1,170 +1,203 @@
-# Signalpost Agent — Norwegian Company Information Finder
+# Signalpost Agent — Company Research with Provenance
 
-An agent that takes a **Norwegian organization number** and returns verified
-company facts, with source links and dates — built for the
-[Signalpost: Build An Agent That Finds Company Information](https://unstop.com/hackathons/signalpost-build-an-agent-that-finds-company-information-builderrai-1754883)
-challenge (Unstop / Builderr.ai).
+This repository is a request-safe implementation for the Signalpost challenge.
 
-## How it works
+## Important fixes in this version
 
-1. **Primary source — Brønnøysund Register Centre (official, free, public API)**
-   `https://data.brreg.no/enhetsregisteret/api` — Norway's government company
-   registry. No API key required. Every fact pulled from here comes with:
-   - the exact **source URL** (the registry entry for that org number)
-   - the **date fetched**
-   - the org number it belongs to (so facts never get attached to the wrong
-     company — this is checked before saving)
+### 1. `python main.py --bulk --count 1000` really handles 1,000
 
-2. **LLM layer — Google Gemini API, FREE tier** (`gemini-2.0-flash`, via
-   Google AI Studio — no credit card required, ever)
-   Takes the verified registry facts and writes a short, human-readable
-   summary/explanation for each company. The LLM **never invents facts** —
-   it only rephrases what the registry already returned, which keeps
-   accuracy high and cost at **$0**. Summaries are generated in **batches**
-   (many companies per request) so a 1,000-company run stays comfortably
-   inside Google's free-tier rate limit and the challenge's 45-minute cap.
+The old implementation first paged the registry for 1,000 organisation numbers and
+then made another registry request for each company. That creates about:
 
-3. **Budget guard**
-   Tracks elapsed time, number of outbound requests, and estimated USD cost
-   in real time, and stops the run safely before exceeding:
-   - 45 minutes
-   - 2,000 outbound requests
-   - $10 in API costs
+- 10 list requests
+- 1,000 company-detail requests
+- 1,000 accounts requests
+- plus Gemini requests
 
-## Project structure
+That can cross the evaluator's 2,000 outbound-request ceiling.
 
-```
-signalpost-agent/
-├── main.py                # CLI entry point — the "one command to run it"
-├── src/
-│   ├── config.py           # limits, model name, constants
-│   ├── models.py           # CompanyProfile data model
-│   ├── brreg_client.py     # Brønnøysund registry API client
-│   ├── llm_client.py       # Gemini (free tier) summary generator
-│   ├── budget_guard.py     # time/request/cost tracking + safe stop
-│   ├── company_list.py     # pulls a list of org numbers to process
-│   └── agent.py            # orchestrates everything
-├── api/
-│   └── server.py           # FastAPI app for a live demo / deployment
-├── tests/
-│   └── test_brreg_client.py
-├── output/                 # generated company_profiles.json lands here
-├── Dockerfile
-├── render.yaml             # one-click deploy config for Render.com
-├── requirements.txt
-└── .env.example
-```
+This version fixes the problem by reusing the company records returned by the
+official registry listing endpoint. For the normal bulk fallback, the expected
+shape is approximately:
 
-## Getting your free Gemini API key
+- ~10 registry-list requests for 1,000 companies
+- 1,000 accounts-register requests
+- 0 external LLM requests by default
+- **~1,010 outbound requests total**
 
-1. Go to https://aistudio.google.com/api-keys
-2. Sign in with any Google account (no credit card, no billing setup)
-3. Click **Create API key** → copy it
+If `company_numbers.txt` is supplied, the agent processes those exact organisation
+numbers. That path uses one detail request + one accounts request per company, so
+1,000 companies use exactly 2,000 requests before retries. The default bulk command
+therefore uses local summaries and does not spend extra requests on Gemini.
 
-That's it — this key is free permanently within Google's rate limits
-(no trial period, no expiry).
+Every retry is counted before the outbound attempt, so the request counter matches
+the challenge's "retries count" rule.
 
-## Setup
+### 2. Gemini 2.0 Flash is removed
 
-```bash
-git clone <your-repo-url>
-cd signalpost-agent
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env            # then paste your FREE Gemini key inside
+Google shut down `gemini-2.0-flash` on June 1, 2026. The default is now
+`gemini-3.5-flash-lite`. Gemini is optional in this repository; the core bulk
+dataset can be produced without an API key.
+
+### 3. No fake financial values
+
+Missing financial data remains `null`. The code never changes missing values to
+zero and never asks the LLM to invent figures.
+
+### 4. Evidence and dates are kept with each profile
+
+Each profile contains:
+
+- `source_url` for the company registry record
+- `financial_source_url` when an accounts record is available
+- `sources[]` with source type, URL, retrieval timestamp and reporting period
+- `first_seen`, `last_updated`, `changed_fields`
+- `fetched_at`
+
+## Run
+
+### Required 1,000-profile command
+
+```powershell
+python main.py --bulk --count 1000
 ```
 
-## Run it — one command
+This is the safe default and does **not** require a Gemini API key.
 
-**Look up a single company:**
-```bash
+Output:
+
+```text
+output/company_profiles.json
+```
+
+### Use the supplied organisation-number list
+
+Put one organisation number per line in `company_numbers.txt`, then run:
+
+```powershell
+python main.py --bulk --count 1000
+```
+
+Or specify another file:
+
+```powershell
+python main.py --bulk --count 1000 --org-list path	o\company_numbers.txt
+```
+
+The file is never uploaded to GitHub if it contains real data: `.gitignore`
+should be used for any private/supplied list if required by the challenge.
+
+### Single-company lookup
+
+```powershell
 python main.py --org 923609016
 ```
 
-**Generate the 1,000+ company profile dataset required for submission:**
-```bash
-python main.py --bulk --count 1000
-```
-This writes `output/company_profiles.json`, respecting the 45-minute /
-2,000-request / $10 budget automatically. If the budget runs out early it
-saves whatever was completed so far instead of crashing.
+### Refresh existing profiles
 
-**Keep an existing dataset current (the "update correctly" requirement):**
-```bash
+```powershell
 python main.py --update
 ```
-Re-fetches every company already in `output/company_profiles.json`,
-detects exactly which fields changed since last time, and only regenerates
-a company's summary if something factual actually changed — everything
-else is left untouched. Each profile also keeps a `first_seen` date and a
-`last_updated` date.
 
-## Run the live API (for a demo / deployment)
+Refresh is designed to be idempotent: it compares tracked fields, records real
+changes and keeps the previous summary when nothing factual changed.
 
-```bash
+### Optional Gemini summaries
+
+Create `.env` from `.env.example` and add your key, then:
+
+```powershell
+python main.py --org 923609016 --llm
+```
+
+For a bulk run:
+
+```powershell
+python main.py --bulk --count 1000 --llm
+```
+
+The program calculates whether enough request budget remains for all Gemini
+summary batches. If not, it skips the Gemini phase instead of breaking the
+1,000-profile run.
+
+## API
+
+Install dependencies and run:
+
+```powershell
 uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
-Then visit: `http://localhost:8000/company/923609016`
 
-## Deploying (free, no server management)
+Then:
 
-### Option A — Render.com (free tier) with auto-deploy from GitHub Actions
-1. Push this repo to GitHub (steps below).
-2. Go to [render.com](https://render.com) → **New → Web Service** → connect
-   your GitHub repo. Render auto-detects `render.yaml`.
-3. Add your `GEMINI_API_KEY` as an environment variable in the Render
-   dashboard, and pick the **Free** instance type.
-4. In the Render dashboard, go to **Settings → Deploy Hook** and copy the
-   URL it gives you.
-5. In your GitHub repo, go to **Settings → Secrets and variables → Actions
-   → New repository secret**, name it `RENDER_DEPLOY_HOOK_URL`, and paste
-   the URL from step 4.
-6. Done. `.github/workflows/ci.yml` now runs tests on every push, and
-   automatically redeploys on Render whenever you push to `main`. If you
-   skip steps 4-5, the workflow's tests still run — the deploy step just
-   quietly skips itself instead of failing.
-
-### Option B — Docker (any host)
-```bash
-docker build -t signalpost-agent .
-docker run -p 8000:8000 --env-file .env signalpost-agent
+```text
+GET /health
+GET /company/{organisation_number}
 ```
 
-## Publishing to GitHub
+The API uses Gemini only when `GEMINI_API_KEY` is present; otherwise it returns a
+deterministic, evidence-based local summary.
 
-```bash
-cd signalpost-agent
-git init
-git add .
-git commit -m "Signalpost agent: Norwegian company info finder"
-git branch -M main
-git remote add origin https://github.com/<your-username>/<your-repo>.git
-git push -u origin main
+## Data sources
+
+Primary source:
+
+https://data.brreg.no/enhetsregisteret/api
+
+Financial source:
+
+https://data.brreg.no/regnskapsregisteret/regnskap
+
+Gemini API documentation:
+
+https://ai.google.dev/gemini-api/docs
+
+## Request/cost safety
+
+Daily evaluator limits are configured as:
+
+- 45 minutes
+- 2,000 outbound requests
+- $10 declared external API cost
+
+The `BudgetGuard` reserves a request immediately before every outbound attempt,
+including retries. A run stops cleanly at the boundary and saves completed
+profiles rather than crashing.
+
+## Tests
+
+```powershell
+python -m pytest tests -v
+python -m py_compile main.py src/*.py api/*.py tests/*.py
 ```
-Then copy the **exact commit URL** (not just the repo link) for submission:
-`https://github.com/<your-username>/<your-repo>/tree/<commit-hash>`
-Get the commit hash with: `git rev-parse HEAD`
 
-## Model / API details (for submission)
+## Project structure
 
-| Item | Value |
-|---|---|
-| Primary data source | Brønnøysund Enhetsregisteret (data.brreg.no) — free, no key |
-| Financial data source | Brønnøysund Regnskapsregisteret (data.brreg.no) — free, no key |
-| LLM used | Google Gemini 2.0 Flash (`gemini-2.0-flash`) via Google AI Studio **free tier** |
-| Purpose of LLM | Summarize/explain verified registry + financial facts (not a search agent) |
-| Estimated cost | **$0.00** — entirely on free tiers |
-| Outbound requests | ~2,000 registry + financial calls + ~50 batched LLM calls for 1,000 companies |
-| Runtime | Typically 15–25 min for 1,000 companies, comfortably under the 45-min cap |
+```text
+signalpost-agent/
+├── main.py
+├── company_numbers.txt       # optional local input list
+├── src/
+│   ├── agent.py
+│   ├── brreg_client.py
+│   ├── budget_guard.py
+│   ├── config.py
+│   ├── llm_client.py
+│   ├── models.py
+│   └── regnskap_client.py
+├── api/server.py
+├── tests/
+├── output/
+├── requirements.txt
+├── Dockerfile
+├── render.yaml
+└── .env.example
+```
 
-## Submission checklist (per challenge rules)
+## Submission note
 
-- [ ] At least 1,000 company profiles → `output/company_profiles.json`
-- [ ] Repository link → your GitHub repo
-- [ ] Exact commit hash → `git rev-parse HEAD`
-- [ ] One command to run it → `python main.py --bulk --count 1000`
-- [ ] Model/API details → see table above
-- [ ] Expected run cost → see table above
-- [ ] Email the code + files to `submit@builderr.ai`
-- [ ] Paste the exact commit URL on the Unstop submission form
+The challenge currently asks for at least 1,000 profiles, the organisation-number
+list used, repository link, exact commit hash, one reproducible run command,
+model/API/licence details, and expected cost per 100-company run. Check the
+current Builderr challenge page and evaluation contract before submitting because
+the organiser controls the final harness and requirements.

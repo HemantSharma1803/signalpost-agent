@@ -1,7 +1,8 @@
 __pycache__/
-*.pyc
-venv/
+*.py[cod]
+.pytest_cache/
 .venv/
+venv/
 .env
-.DS_Store
-*.log
+output/company_profiles.json
+output/*.tmp

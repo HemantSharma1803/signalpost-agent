@@ -1,0 +1,2 @@
+# Optional: put one supplied Norwegian organisation number per line here.
+# Leave this file with only comments to use the official registry listing fallback.
