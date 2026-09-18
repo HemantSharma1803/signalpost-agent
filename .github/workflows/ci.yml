@@ -1,0 +1,49 @@
+name: CI and Deploy
+
+# Runs automatically on every push. The build-check job always runs first;
+# deploy only runs afterward, only on pushes to main, and only if you've
+# added the RENDER_DEPLOY_HOOK_URL secret (see README "Deploying" section).
+# If that secret isn't set, the deploy step is skipped automatically —
+# it will never fail the workflow.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile check (catches syntax errors before they reach main)
+        run: python -m py_compile main.py src/*.py api/*.py tests/*.py
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -v
+
+  deploy:
+    needs: build-check
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL secret not set — skipping deploy."
+            echo "See README.md 'Deploying' section to enable auto-deploy."
+            exit 0
+          fi
+          curl -fsS -X POST "$DEPLOY_HOOK"
+          echo "Deploy triggered successfully."
